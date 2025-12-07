@@ -4,9 +4,7 @@ import struct
 import zlib
 from pathlib import Path
 
-
-HEADER_SIZE = 0x44
-MONEY_SIG = b"\x29\x00\x00\x00\x00\x22\x6E\x00\x00\x00"  # хвост после денег
+HEADER_SIZE = 0x44  # размер заголовка в начале mainSave.bsg
 
 
 def parse_blocks(comp: bytes):
@@ -17,8 +15,8 @@ def parse_blocks(comp: bytes):
     blocks = []
     offset = 0
     while offset < len(comp):
+        # все zlib-блоки начинаются с 0x78 0x9C
         if comp[offset:offset + 2] != b"\x78\x9C":
-            # дальше уже не zlib — выходим
             break
 
         obj = zlib.decompressobj()
@@ -27,7 +25,6 @@ def parse_blocks(comp: bytes):
         blocks.append((offset, consumed, len(dec)))
 
         if not obj.unused_data:
-            # больше блоков нет
             offset += consumed
             break
 
@@ -65,11 +62,38 @@ def read_comp_blocks(comp: bytes, blocks):
     return comp_blocks
 
 
+def find_money_positions(dec: bytes):
+    """
+    Ищем в распакованном блоке структуру:
+
+        [4 байта денег LE] 29 00 00 00 00 22 XX 00 00 00
+
+    Возвращаем список (offset_денег, значение_денег).
+    """
+    prefix = b"\x29\x00\x00\x00\x00\x22"
+    results = []
+
+    idx = dec.find(prefix)
+    while idx != -1:
+        # должны быть хотя бы 4 байта перед префиксом и 4 после него
+        if idx >= 4 and idx + 6 + 1 + 3 <= len(dec):
+            money_bytes = dec[idx - 4:idx]
+            money = struct.unpack("<I", money_bytes)[0]
+
+            # проверяем, что структура действительно "... 22 XX 00 00 00"
+            tail_three = dec[idx + 6 + 1: idx + 6 + 1 + 3]
+            if tail_three == b"\x00\x00\x00":
+                results.append((idx - 4, money))
+
+        idx = dec.find(prefix, idx + 1)
+
+    return results
+
+
 def patch_money(original_bytes: bytes, new_money: int):
     header = bytearray(original_bytes[:HEADER_SIZE])
     comp = original_bytes[HEADER_SIZE:]
 
-    # разбор блоков
     blocks = parse_blocks(comp)
     if not blocks:
         raise RuntimeError("не удалось распарсить zlib-блоки")
@@ -82,15 +106,16 @@ def patch_money(original_bytes: bytes, new_money: int):
 
     for i, raw in enumerate(comp_blocks):
         dec = zlib.decompress(raw)
-        idx = dec.find(MONEY_SIG)
-        if idx >= 4:
-            # нашли сигнатуру, читаем деньги
-            cur_money = struct.unpack("<I", dec[idx - 4:idx])[0]
-            current_values.append(cur_money)
-            found_block_indices.append(i)
+        positions = find_money_positions(dec)
 
-            # патчим на новое значение
-            dec = dec[:idx - 4] + struct.pack("<I", new_money) + dec[idx:]
+        if positions:
+            found_block_indices.append(i)
+            current_values.extend([m for _, m in positions])
+
+            # патчим все найденные позиции в этом блоке
+            for pos, old_money in positions:
+                dec = dec[:pos] + struct.pack("<I", new_money) + dec[pos + 4:]
+
             raw = zlib.compress(dec)
 
         new_comp_blocks.append(raw)
@@ -98,7 +123,7 @@ def patch_money(original_bytes: bytes, new_money: int):
     if not found_block_indices:
         raise RuntimeError("не нашли сигнатуру денег ни в одном блоке")
 
-    # собираем новый хвост: блок_i + размер следующего блока
+    # собираем новый хвост: блок_i + размер следующего блока (4 байта LE)
     comp_new = bytearray()
     for i, raw in enumerate(new_comp_blocks):
         comp_new += raw
@@ -124,7 +149,9 @@ def main():
     if len(sys.argv) >= 4:
         out_path = Path(sys.argv[3])
     else:
-        out_path = in_path.with_name(in_path.stem + f"_money_{new_money}" + in_path.suffix)
+        out_path = in_path.with_name(
+            in_path.stem + f"_money_{new_money}" + in_path.suffix
+        )
 
     data = in_path.read_bytes()
     new_data, blocks_idx, cur_vals = patch_money(data, new_money)
