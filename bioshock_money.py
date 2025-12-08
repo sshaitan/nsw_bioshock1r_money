@@ -62,32 +62,75 @@ def read_comp_blocks(comp: bytes, blocks):
     return comp_blocks
 
 
-def find_money_positions(dec: bytes):
+def money_positions_pattern1(dec: bytes):
     """
-    Ищем в распакованном блоке структуру:
+    Старая сигнатура (ранние сейвы):
 
         [4 байта денег LE] 29 00 00 00 00 22 XX 00 00 00
-
-    Возвращаем список (offset_денег, значение_денег).
     """
     prefix = b"\x29\x00\x00\x00\x00\x22"
     results = []
 
     idx = dec.find(prefix)
     while idx != -1:
-        # должны быть хотя бы 4 байта перед префиксом и 4 после него
         if idx >= 4 and idx + 6 + 1 + 3 <= len(dec):
             money_bytes = dec[idx - 4:idx]
             money = struct.unpack("<I", money_bytes)[0]
 
-            # проверяем, что структура действительно "... 22 XX 00 00 00"
             tail_three = dec[idx + 6 + 1: idx + 6 + 1 + 3]
             if tail_three == b"\x00\x00\x00":
                 results.append((idx - 4, money))
-
         idx = dec.find(prefix, idx + 1)
 
     return results
+
+
+def money_positions_pattern2(dec: bytes):
+    """
+    Новая сигнатура (позже по игре, как в сейве с 12 монетами):
+
+        00 22 [4 байта денег LE] 2a 00 00 00 00 22 XX 00 00 00
+
+    Ищем именно такую структуру.
+    """
+    results = []
+    for idx in range(0, len(dec) - 16):
+        # начало сигнатуры
+        if dec[idx:idx + 2] != b"\x00\x22":
+            continue
+
+        # 00 22 [money] 2a 00 00 00 00 22 XX 00 00 00
+        if idx + 2 + 4 + 4 + 1 + 3 > len(dec):
+            continue
+
+        money = struct.unpack("<I", dec[idx + 2:idx + 6])[0]
+
+        # проверяем 2a 00 00 00
+        if dec[idx + 6:idx + 10] != b"\x2a\x00\x00\x00":
+            continue
+
+        # проверяем 00 22
+        if dec[idx + 10:idx + 12] != b"\x00\x22":
+            continue
+
+        # последние три нуля
+        if dec[idx + 13:idx + 16] != b"\x00\x00\x00":
+            continue
+
+        # считаем, что деньги лежат по адресу (idx + 2)
+        results.append((idx + 2, money))
+
+    return results
+
+
+def find_money_positions(dec: bytes):
+    """
+    Универсальный поиск денег в распакованном блоке:
+    сначала пробуем старую сигнатуру, затем новую.
+    """
+    res1 = money_positions_pattern1(dec)
+    res2 = money_positions_pattern2(dec)
+    return res1 + res2
 
 
 def patch_money(original_bytes: bytes, new_money: int):
